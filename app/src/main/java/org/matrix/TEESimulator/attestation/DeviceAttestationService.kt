@@ -249,6 +249,10 @@ object DeviceAttestationService {
                 verifiedBootKey = null
             }
 
+            if (verifiedBootHash?.all { it == 0.toByte() } == true) {
+                verifiedBootHash = null
+            }
+
             SystemLogger.info(
                 "Successfully extracted attestation data: version=$attestVersion, osVersion=$osVersion, osPatch=$osPatchLevel, vendorPatch=$vendorPatchLevel, bootPatch=$bootPatchLevel, moduleHash=${moduleHash?.toHex()}, bootKey=${verifiedBootKey?.toHex()}, bootHash=${verifiedBootHash?.toHex()}"
             )
