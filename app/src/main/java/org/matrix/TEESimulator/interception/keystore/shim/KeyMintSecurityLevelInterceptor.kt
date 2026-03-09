@@ -3,7 +3,6 @@ package org.matrix.TEESimulator.interception.keystore.shim
 import android.hardware.security.keymint.Algorithm
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
-import android.hardware.security.keymint.KeyPurpose
 import android.hardware.security.keymint.Tag
 import android.os.IBinder
 import android.os.Parcel
@@ -248,9 +247,7 @@ class KeyMintSecurityLevelInterceptor(
                 val params = data.createTypedArray(KeyParameter.CREATOR)!!
                 val parsedParams = KeyMintAttestation(params)
                 val keyId = KeyIdentifier(callingUid, keyDescriptor.alias)
-                val isAttestKeyRequest =
-                    parsedParams.purpose.size == 1 &&
-                        parsedParams.purpose.contains(KeyPurpose.ATTEST_KEY)
+                val isAttestKeyRequest = parsedParams.isAttestKey()
 
                 val needsSoftwareGeneration =
                     ConfigurationManager.shouldGenerate(callingUid) ||
@@ -468,6 +465,7 @@ class KeyMintSecurityLevelInterceptor(
                     algorithm = record.algorithm,
                     ecCurve = record.ecCurve,
                     ecCurveName = "",
+                    origin = null,
                     blockMode = emptyList(),
                     padding = emptyList(),
                     purpose = record.purposes,
@@ -560,7 +558,7 @@ class KeyMintSecurityLevelInterceptor(
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
         // Caches patched chains to prevent re-generation and signature inconsistencies
         private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
-        private val attestationKeys = ConcurrentHashMap.newKeySet<KeyIdentifier>()
+        val attestationKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
         fun getGeneratedKeyResponse(keyId: KeyIdentifier): KeyEntryResponse? =

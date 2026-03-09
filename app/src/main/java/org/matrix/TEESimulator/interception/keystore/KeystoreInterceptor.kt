@@ -407,8 +407,9 @@ private data class LegacyKeygenParameters(
         return KeyMintAttestation(
             keySize = this.keySize,
             algorithm = this.algorithm,
-            ecCurve = 0, // Not explicitly available in legacy args, but not critical
+            ecCurve = 0,
             ecCurveName = this.ecCurveName ?: "",
+            origin = null,
             blockMode = listOf<Int>(),
             padding = listOf<Int>(),
             purpose = this.purpose,

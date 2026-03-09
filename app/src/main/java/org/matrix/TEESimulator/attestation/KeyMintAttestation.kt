@@ -1,6 +1,7 @@
 package org.matrix.TEESimulator.attestation
 
 import android.hardware.security.keymint.*
+import android.hardware.security.keymint.KeyOrigin
 import java.math.BigInteger
 import java.util.Date
 import javax.security.auth.x500.X500Principal
@@ -20,6 +21,7 @@ data class KeyMintAttestation(
     val algorithm: Int,
     val ecCurve: Int,
     val ecCurveName: String,
+    val origin: Int?,
     val blockMode: List<Int>,
     val padding: List<Int>,
     val purpose: List<Int>,
@@ -53,6 +55,9 @@ data class KeyMintAttestation(
         // AOSP: [key_param(tag = EC_CURVE, field = EcCurve)]
         ecCurve = params.findEcCurve(Tag.EC_CURVE) ?: 0,
         ecCurveName = params.deriveEcCurveName(),
+
+        // AOSP: [key_param(tag = ORIGIN, field = Origin)]
+        origin = params.findOrigin(Tag.ORIGIN),
 
         // AOSP: [key_param(tag = BLOCK_MODE, field = BlockMode)]
         blockMode = params.findAllBlockMode(Tag.BLOCK_MODE),
@@ -99,6 +104,10 @@ data class KeyMintAttestation(
         // Log all parsed parameters for debugging purposes.
         params.forEach { KeyMintParameterLogger.logParameter(it) }
     }
+
+    fun isAttestKey(): Boolean = purpose.size == 1 && purpose.contains(KeyPurpose.ATTEST_KEY)
+
+    fun isImportKey(): Boolean = origin == KeyOrigin.IMPORTED || origin == KeyOrigin.SECURELY_IMPORTED
 }
 
 // --- Private helper extension functions for parsing KeyParameter arrays ---
@@ -114,6 +123,10 @@ private fun Array<KeyParameter>.findAlgorithm(tag: Int): Int? =
 /** Maps to AOSP field = EcCurve */
 private fun Array<KeyParameter>.findEcCurve(tag: Int): Int? =
     this.find { it.tag == tag }?.value?.ecCurve
+
+/** Maps to AOSP field = Origin */
+private fun Array<KeyParameter>.findOrigin(tag: Int): Int? =
+    this.find { it.tag == tag }?.value?.origin
 
 /** Maps to AOSP field = LongInteger */
 private fun Array<KeyParameter>.findLongInteger(tag: Int): BigInteger? =
