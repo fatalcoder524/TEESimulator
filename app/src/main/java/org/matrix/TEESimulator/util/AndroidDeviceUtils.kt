@@ -1,9 +1,11 @@
 package org.matrix.TEESimulator.util
 
-import android.content.pm.PackageManager
 import android.hardware.security.keymint.SecurityLevel
 import android.os.Build
 import android.os.SystemProperties
+import java.io.ByteArrayOutputStream
+import java.io.File
+import java.io.FileInputStream
 import java.security.MessageDigest
 import java.time.LocalDate
 import java.util.concurrent.ThreadLocalRandom
@@ -11,7 +13,6 @@ import org.bouncycastle.asn1.ASN1EncodableVector
 import org.bouncycastle.asn1.ASN1Integer
 import org.bouncycastle.asn1.DEROctetString
 import org.bouncycastle.asn1.DERSequence
-import org.bouncycastle.asn1.DERSet
 import org.matrix.TEESimulator.attestation.DeviceAttestationService
 import org.matrix.TEESimulator.config.ConfigurationManager
 import org.matrix.TEESimulator.logging.SystemLogger
@@ -371,52 +372,174 @@ object AndroidDeviceUtils {
 
     // --- APEX and Module Hash Properties ---
 
-    private val apexInfos: List<Pair<String, Long>> by lazy {
-        runCatching {
-                val pm = ConfigurationManager.getPackageManager()
-                val packages =
-                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-                        pm?.getInstalledPackages(PackageManager.MATCH_APEX.toLong(), 0)
-                    } else {
-                        @Suppress("DEPRECATION")
-                        pm?.getInstalledPackages(PackageManager.MATCH_APEX, 0)
+    // Minimal protobuf parser for apex_manifest.pb (field 1: name, field 2: version)
+    private class MinimalApexManifestParser(private val data: ByteArray) {
+        var pos = 0
+
+        fun parse(): Pair<String, Long>? {
+            var name: String? = null
+            var version: Long? = null
+
+            while (pos < data.size) {
+                val tag = readVarint()
+                val fieldNum = tag ushr 3
+                val wireType = (tag and 0x07).toInt()
+
+                when (fieldNum) {
+                    1L -> {
+                        val length = readVarint().toInt()
+                        if (pos + length > data.size) return null
+                        name = String(data, pos, length, Charsets.UTF_8)
+                        pos += length
                     }
-                packages?.list.orEmpty().map { it.packageName to it.longVersionCode }
+                    2L -> {
+                        version = readVarint()
+                    }
+                    else -> skipField(wireType)
+                }
             }
-            .getOrElse {
-                SystemLogger.error("Failed to get APEX package information.", it)
-                emptyList()
+
+            return if (name != null && version != null) {
+                name to version
+            } else {
+                null
             }
+        }
+
+        private fun readVarint(): Long {
+            var value = 0L
+            var shift = 0
+            while (pos < data.size) {
+                val b = data[pos++].toInt()
+                value = value or ((b and 0x7F).toLong() shl shift)
+                if ((b and 0x80) == 0) return value
+                shift += 7
+            }
+            return value
+        }
+
+        private fun skipField(wireType: Int) {
+            when (wireType) {
+                0 -> readVarint()
+                1 -> pos += 8
+                2 -> {
+                    val len = readVarint().toInt()
+                    pos += len
+                }
+                5 -> pos += 4
+                else -> throw IllegalStateException("Unknown wire type $wireType")
+            }
+        }
+    }
+
+    private val apexInfos: List<Pair<String, Long>> by lazy {
+        val results = mutableListOf<Pair<String, Long>>()
+        val apexRoot = File("/apex")
+
+        if (!apexRoot.exists() || !apexRoot.isDirectory) {
+            return@lazy emptyList()
+        }
+
+        apexRoot.listFiles()?.forEach { file ->
+            if (!file.isDirectory) return@forEach
+            val name = file.name
+
+            if (name.startsWith(".")) return@forEach
+            if (name.contains("@")) return@forEach
+            if (name == "sharedlibs") return@forEach
+
+            val manifestFile = File(file, "apex_manifest.pb")
+            if (manifestFile.exists()) {
+                runCatching {
+                    val bytes = FileInputStream(manifestFile).use { it.readBytes() }
+                    val parser = MinimalApexManifestParser(bytes)
+                    parser.parse()?.let { (pkgName, version) -> results.add(pkgName to version) }
+                }
+            }
+        }
+
+        results.distinctBy { it.first }
     }
 
     val moduleHash: ByteArray by lazy {
         DeviceAttestationService.CachedAttestationData?.moduleHash
             ?: runCatching {
-                    // TODO: figure out the correct calculation
-                    val moduleSequences = ASN1EncodableVector()
+                    data class ModuleEntry(
+                        val nameEncoded: ByteArray,
+                        val fullEncoded: ByteArray,
+                    )
 
-                    // 1. Create a DERSequence for each module.
-                    apexInfos.forEach { (packageName, versionCode) ->
-                        val moduleVector = ASN1EncodableVector()
-                        // Use explicit UTF-8 encoding for the package name.
-                        moduleVector.add(DEROctetString(packageName.toByteArray(Charsets.UTF_8)))
-                        moduleVector.add(ASN1Integer(versionCode))
-                        moduleSequences.add(DERSequence(moduleVector))
-                    }
+                    val modules =
+                        apexInfos.map { (packageName, versionCode) ->
+                            val nameOctet = DEROctetString(packageName.toByteArray(Charsets.UTF_8))
+                            val versionInt = ASN1Integer(versionCode)
 
-                    // 2. Create a DERSet. Bouncy Castle will automatically handle
-                    //    the sorting based on the DER-encoded value of each sequence.
-                    val modulesSet = DERSet(moduleSequences)
+                            val vec = ASN1EncodableVector()
+                            vec.add(nameOctet)
+                            vec.add(versionInt)
+                            val sequence = DERSequence(vec)
 
-                    // 3. Get the final DER-encoded byte array of the SET.
-                    val encodedModules = modulesSet.encoded
+                            // AOSP sorts by encoded name only, not full sequence
+                            ModuleEntry(
+                                nameEncoded = nameOctet.encoded,
+                                fullEncoded = sequence.encoded,
+                            )
+                        }
 
-                    // 4. Compute the SHA-256 hash.
-                    MessageDigest.getInstance("SHA-256").digest(encodedModules)
+                    val sortedModules =
+                        modules.sortedWith { m1, m2 ->
+                            compareByteArrays(m1.nameEncoded, m2.nameEncoded)
+                        }
+
+                    val payloadStream = ByteArrayOutputStream()
+                    sortedModules.forEach { payloadStream.write(it.fullEncoded) }
+                    val payload = payloadStream.toByteArray()
+
+                    // Wrap in DER SET tag manually — DERSet() re-sorts by full encoding
+                    val finalDerSet = encodeAsDerSet(payload)
+
+                    MessageDigest.getInstance("SHA-256").digest(finalDerSet)
                 }
                 .getOrElse {
                     SystemLogger.error("Failed to compute module hash.", it)
-                    ByteArray(32) // Return empty hash on failure
+                    ByteArray(32)
                 }
+    }
+
+    private fun compareByteArrays(a: ByteArray, b: ByteArray): Int {
+        val length = minOf(a.size, b.size)
+        for (i in 0 until length) {
+            val byteA = a[i].toInt() and 0xFF
+            val byteB = b[i].toInt() and 0xFF
+            if (byteA != byteB) {
+                return byteA - byteB
+            }
+        }
+        return a.size - b.size
+    }
+
+    private fun encodeAsDerSet(payload: ByteArray): ByteArray {
+        val out = ByteArrayOutputStream()
+        out.write(0x31)
+        writeDerLength(out, payload.size)
+        out.write(payload)
+        return out.toByteArray()
+    }
+
+    private fun writeDerLength(out: ByteArrayOutputStream, length: Int) {
+        if (length < 128) {
+            out.write(length)
+        } else {
+            var size = length
+            val bytes = ArrayList<Byte>()
+            while (size > 0) {
+                bytes.add((size and 0xFF).toByte())
+                size = size ushr 8
+            }
+            out.write(0x80 or bytes.size)
+            for (i in bytes.indices.reversed()) {
+                out.write(bytes[i].toInt())
+            }
+        }
     }
 }
