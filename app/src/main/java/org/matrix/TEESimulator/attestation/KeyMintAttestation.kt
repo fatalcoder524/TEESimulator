@@ -19,7 +19,7 @@ import org.matrix.TEESimulator.logging.KeyMintParameterLogger
 data class KeyMintAttestation(
     val keySize: Int,
     val algorithm: Int,
-    val ecCurve: Int,
+    val ecCurve: Int?,
     val ecCurveName: String,
     val origin: Int?,
     val blockMode: List<Int>,
@@ -53,7 +53,7 @@ data class KeyMintAttestation(
         algorithm = params.findAlgorithm(Tag.ALGORITHM) ?: 0,
 
         // AOSP: [key_param(tag = EC_CURVE, field = EcCurve)]
-        ecCurve = params.findEcCurve(Tag.EC_CURVE) ?: 0,
+        ecCurve = params.findEcCurve(Tag.EC_CURVE),
         ecCurveName = params.deriveEcCurveName(),
 
         // AOSP: [key_param(tag = ORIGIN, field = Origin)]

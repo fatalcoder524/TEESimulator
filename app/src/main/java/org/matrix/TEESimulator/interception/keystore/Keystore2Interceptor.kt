@@ -305,7 +305,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                             certChain = keyData.second,
                             algorithm = parsedParameters.algorithm,
                             keySize = parsedParameters.keySize,
-                            ecCurve = parsedParameters.ecCurve,
+                            ecCurve = parsedParameters.ecCurve ?: 0,
                             purposes = parsedParameters.purpose,
                             digests = parsedParameters.digest,
                             isAttestationKey = true,
@@ -337,6 +337,7 @@ object Keystore2Interceptor : AbstractKeystoreInterceptor() {
                         )
                         finalChain =
                             AttestationPatcher.patchCertificateChain(originalChain, callingUid)
+                        KeyMintSecurityLevelInterceptor.patchedChains[keyId] = finalChain
                     }
 
                     CertificateHelper.updateCertificateChain(response.metadata, finalChain)

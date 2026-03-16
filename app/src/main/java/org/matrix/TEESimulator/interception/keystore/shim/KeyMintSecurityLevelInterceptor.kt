@@ -333,7 +333,7 @@ class KeyMintSecurityLevelInterceptor(
         } ?: throw Exception("Both native and BouncyCastle cert gen failed.")
 
         cleanupKeyData(keyId)
-        val response = buildKeyEntryResponse(keyData.second, parsedParams, keyDescriptor)
+        val response = buildKeyEntryResponse(callingUid, keyData.second, parsedParams, keyDescriptor)
         generatedKeys[keyId] = GeneratedKeyInfo(keyData.first, keyDescriptor.nspace, response)
         if (isAttestKeyRequest) attestationKeys.add(keyId)
 
@@ -345,7 +345,7 @@ class KeyMintSecurityLevelInterceptor(
             certChain = keyData.second.toList(),
             algorithm = parsedParams.algorithm,
             keySize = parsedParams.keySize,
-            ecCurve = parsedParams.ecCurve,
+            ecCurve = parsedParams.ecCurve ?: 0,
             purposes = parsedParams.purpose,
             digests = parsedParams.digest,
             isAttestationKey = isAttestKeyRequest,
@@ -383,7 +383,7 @@ class KeyMintSecurityLevelInterceptor(
             val config = CertGenConfig(
                 algorithm = params.algorithm,
                 keySize = params.keySize,
-                ecCurve = params.ecCurve,
+                ecCurve = params.ecCurve ?: 0,
                 rsaPublicExponent = params.rsaPublicExponent?.toLong() ?: 65537L,
                 attestationChallenge = params.attestationChallenge,
                 purposes = params.purpose.toIntArray(),
@@ -427,6 +427,7 @@ class KeyMintSecurityLevelInterceptor(
     }
 
     private fun buildKeyEntryResponse(
+        callingUid: Int,
         chain: List<Certificate>,
         params: KeyMintAttestation,
         descriptor: KeyDescriptor,
@@ -443,7 +444,7 @@ class KeyMintSecurityLevelInterceptor(
                 keySecurityLevel = securityLevel
                 key = normalizedKeyDescriptor
                 CertificateHelper.updateCertificateChain(this, chain.toTypedArray()).getOrThrow()
-                authorizations = params.toAuthorizations(securityLevel)
+                authorizations = params.toAuthorizations(callingUid, securityLevel)
                 modificationTimeMs = System.currentTimeMillis()
             }
         return KeyEntryResponse().apply {
@@ -521,7 +522,7 @@ class KeyMintSecurityLevelInterceptor(
                     secondImei = null,
                 )
 
-                val response = buildKeyEntryResponse(certChain, attestation, descriptor)
+                val response = buildKeyEntryResponse(record.uid, certChain, attestation, descriptor)
                 generatedKeys[keyId] = GeneratedKeyInfo(keyPair, record.nspace, response)
                 if (record.isAttestationKey) attestationKeys.add(keyId)
 
@@ -605,8 +606,7 @@ class KeyMintSecurityLevelInterceptor(
         }
 
         val generatedKeys = ConcurrentHashMap<KeyIdentifier, GeneratedKeyInfo>()
-        // Caches patched chains to prevent re-generation and signature inconsistencies
-        private val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
+        val patchedChains = ConcurrentHashMap<KeyIdentifier, Array<Certificate>>()
         val attestationKeys: MutableSet<KeyIdentifier> = ConcurrentHashMap.newKeySet()
         private val interceptedOperations = ConcurrentHashMap<IBinder, OperationInterceptor>()
 
@@ -666,7 +666,10 @@ class KeyMintSecurityLevelInterceptor(
     }
 }
 
-private fun KeyMintAttestation.toAuthorizations(securityLevel: Int): Array<Authorization> {
+private fun KeyMintAttestation.toAuthorizations(
+    callingUid: Int,
+    securityLevel: Int,
+): Array<Authorization> {
     val authList = mutableListOf<Authorization>()
 
     fun createAuth(tag: Int, value: KeyParameterValue): Authorization {
@@ -681,19 +684,35 @@ private fun KeyMintAttestation.toAuthorizations(securityLevel: Int): Array<Autho
         }
     }
 
+    authList.add(createAuth(Tag.ALGORITHM, KeyParameterValue.algorithm(this.algorithm)))
+    if (this.ecCurve != null) {
+        authList.add(createAuth(Tag.EC_CURVE, KeyParameterValue.ecCurve(this.ecCurve)))
+    }
     this.purpose.forEach { authList.add(createAuth(Tag.PURPOSE, KeyParameterValue.keyPurpose(it))) }
     this.digest.forEach { authList.add(createAuth(Tag.DIGEST, KeyParameterValue.digest(it))) }
-
-    authList.add(createAuth(Tag.ALGORITHM, KeyParameterValue.algorithm(this.algorithm)))
+    this.padding.forEach { authList.add(createAuth(Tag.PADDING, KeyParameterValue.paddingMode(it))) }
     authList.add(createAuth(Tag.KEY_SIZE, KeyParameterValue.integer(this.keySize)))
-    authList.add(createAuth(Tag.EC_CURVE, KeyParameterValue.ecCurve(this.ecCurve)))
-    authList.add(
-        createAuth(
-            Tag.ORIGIN,
-            KeyParameterValue.origin(this.origin ?: KeyOrigin.GENERATED),
-        )
-    )
+    if (this.rsaPublicExponent != null) {
+        authList.add(createAuth(Tag.RSA_PUBLIC_EXPONENT, KeyParameterValue.longInteger(this.rsaPublicExponent.toLong())))
+    }
     authList.add(createAuth(Tag.NO_AUTH_REQUIRED, KeyParameterValue.boolValue(true)))
+    authList.add(createAuth(Tag.ORIGIN, KeyParameterValue.origin(this.origin ?: KeyOrigin.GENERATED)))
+    authList.add(createAuth(Tag.OS_VERSION, KeyParameterValue.integer(AndroidDeviceUtils.osVersion)))
+
+    val osPatch = AndroidDeviceUtils.getPatchLevel(callingUid)
+    if (osPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.OS_PATCHLEVEL, KeyParameterValue.integer(osPatch)))
+    }
+    val vendorPatch = AndroidDeviceUtils.getVendorPatchLevelLong(callingUid)
+    if (vendorPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.VENDOR_PATCHLEVEL, KeyParameterValue.integer(vendorPatch)))
+    }
+    val bootPatch = AndroidDeviceUtils.getBootPatchLevelLong(callingUid)
+    if (bootPatch != AndroidDeviceUtils.DO_NOT_REPORT) {
+        authList.add(createAuth(Tag.BOOT_PATCHLEVEL, KeyParameterValue.integer(bootPatch)))
+    }
+    authList.add(createAuth(Tag.CREATION_DATETIME, KeyParameterValue.dateTime(System.currentTimeMillis())))
+    authList.add(createAuth(Tag.USER_ID, KeyParameterValue.integer(callingUid / 100000)))
 
     return authList.toTypedArray()
 }
