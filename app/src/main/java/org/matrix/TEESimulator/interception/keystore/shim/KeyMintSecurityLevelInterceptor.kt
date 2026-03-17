@@ -1,9 +1,11 @@
 package org.matrix.TEESimulator.interception.keystore.shim
 
 import android.hardware.security.keymint.Algorithm
+import android.hardware.security.keymint.EcCurve
 import android.hardware.security.keymint.KeyParameter
 import android.hardware.security.keymint.KeyParameterValue
 import android.hardware.security.keymint.KeyOrigin
+import android.hardware.security.keymint.SecurityLevel
 import android.hardware.security.keymint.Tag
 import android.os.IBinder
 import android.os.Parcel
@@ -17,6 +19,7 @@ import java.security.cert.Certificate
 import java.security.cert.CertificateFactory
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedDeque
 import java.util.concurrent.atomic.AtomicInteger
 import org.matrix.TEESimulator.attestation.AttestationBuilder
 import org.matrix.TEESimulator.attestation.AttestationConstants
@@ -45,6 +48,9 @@ class KeyMintSecurityLevelInterceptor(
         val nspace: Long,
         val response: KeyEntryResponse,
     )
+
+    private val activeOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<SoftwareOperation>>()
+    private val recentOps = ConcurrentHashMap<Int, ConcurrentLinkedDeque<Long>>()
 
     override fun onPreTransact(
         txId: Long,
@@ -193,42 +199,90 @@ class KeyMintSecurityLevelInterceptor(
         return TransactionResult.SkipTransaction
     }
 
+    private fun pruneOpsForUid(uid: Int, newOp: SoftwareOperation, maxOps: Int = MAX_CONCURRENT_OPS_PER_UID) {
+        val ops = activeOps.computeIfAbsent(uid) { ConcurrentLinkedDeque() }
+        val before = ops.size
+        ops.removeIf { it.finalized }
+        val afterClean = ops.size
+        while (ops.size >= maxOps) {
+            val oldest = ops.pollFirst() ?: break
+            if (!oldest.finalized) {
+                SystemLogger.info("[LRU] Pruning operation for uid=$uid (active=${ops.size}/$maxOps)")
+                oldest.abort()
+            }
+        }
+        ops.addLast(newOp)
+        SystemLogger.debug("[LRU] uid=$uid ops: before=$before cleaned=${before - afterClean} active=${ops.size}")
+    }
+
+    private fun trackAndEnforceOpLimit(callingUid: Int, txId: Long): TransactionResult? {
+        if (securityLevel != SecurityLevel.STRONGBOX) return null
+        val timestamps = recentOps.computeIfAbsent(callingUid) { ConcurrentLinkedDeque() }
+        val cutoff = System.nanoTime() - STRONGBOX_OP_WINDOW_NS
+        timestamps.removeIf { it < cutoff }
+        val swOps = activeOps[callingUid]?.count { !it.finalized } ?: 0
+        if (timestamps.size + swOps >= STRONGBOX_MAX_CONCURRENT_OPS) {
+            SystemLogger.info("[TX_ID: $txId] StrongBox op limit reached for uid=$callingUid (hw=${timestamps.size} sw=$swOps max=$STRONGBOX_MAX_CONCURRENT_OPS)")
+            return InterceptorUtils.createErrorReply(KEYMINT_TOO_MANY_OPERATIONS)
+        }
+        timestamps.addLast(System.nanoTime())
+        return null
+    }
+
     private fun handleCreateOperation(
         txId: Long,
         callingUid: Int,
         data: Parcel,
     ): TransactionResult {
+        SystemLogger.debug("[TX_ID: $txId] createOperation parcel: dataSize=${data.dataSize()} dataAvail=${data.dataAvail()} dataPos=${data.dataPosition()}")
         data.enforceInterface(IKeystoreSecurityLevel.DESCRIPTOR)
         val keyDescriptor = data.readTypedObject(KeyDescriptor.CREATOR)!!
 
-        // An operation must use the KEY_ID domain.
-        if (keyDescriptor.domain != Domain.KEY_ID) {
-            return TransactionResult.ContinueAndSkipPost
+        SystemLogger.debug("[TX_ID: $txId] createOperation descriptor: domain=${keyDescriptor.domain} nspace=${keyDescriptor.nspace} alias=${keyDescriptor.alias}")
+
+        // Android framework calls createOperation with domain=APP+alias;
+        // keystore2 internally resolves to KEY_ID — but software keys never
+        // reach keystore2's database, so we must handle both lookup paths.
+        val generatedKeyInfo = when (keyDescriptor.domain) {
+            Domain.APP -> {
+                val alias = keyDescriptor.alias ?: run {
+                    SystemLogger.info("[TX_ID: $txId] createOperation domain=APP with null alias, forwarding to HAL")
+                    return TransactionResult.ContinueAndSkipPost
+                }
+                generatedKeys[KeyIdentifier(callingUid, alias)] ?: run {
+                    SystemLogger.info("[TX_ID: $txId] createOperation alias=$alias not in generatedKeys, forwarding to HAL")
+                    return TransactionResult.ContinueAndSkipPost
+                }
+            }
+            Domain.KEY_ID -> {
+                findGeneratedKeyByKeyId(callingUid, keyDescriptor.nspace) ?: run {
+                    trackAndEnforceOpLimit(callingUid, txId)?.let { return it }
+                    SystemLogger.info("[TX_ID: $txId] createOperation KeyId(${keyDescriptor.nspace}) NOT FOUND for uid=$callingUid. Forwarding to HAL.")
+                    return TransactionResult.Continue
+                }
+            }
+            else -> {
+                SystemLogger.info("[TX_ID: $txId] createOperation domain=${keyDescriptor.domain}, forwarding to HAL")
+                return TransactionResult.ContinueAndSkipPost
+            }
         }
 
-        val nspace = keyDescriptor.nspace
-        val generatedKeyInfo = findGeneratedKeyByKeyId(callingUid, nspace)
-
-        if (generatedKeyInfo == null) {
-            SystemLogger.debug(
-                "[TX_ID: $txId] Operation for unknown/hardware KeyId ($nspace). Forwarding."
-            )
-            return TransactionResult.Continue
-        }
-
-        SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for KeyId $nspace.")
+        SystemLogger.info("[TX_ID: $txId] Creating SOFTWARE operation for uid=$callingUid.")
 
         val params = data.createTypedArray(KeyParameter.CREATOR)!!
         val parsedParams = KeyMintAttestation(params).let { p ->
             if (p.algorithm != 0) p
             else p.copy(algorithm = when (generatedKeyInfo.keyPair.private.algorithm) {
-                "EC" -> Algorithm.EC
+                "EC", "ECDSA" -> Algorithm.EC
                 "RSA" -> Algorithm.RSA
                 else -> p.algorithm
             })
         }
 
-        val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams)
+        val opLatency = if (securityLevel == SecurityLevel.STRONGBOX) STRONGBOX_OP_LATENCY_FLOOR_MS else 0L
+        val softwareOperation = SoftwareOperation(txId, generatedKeyInfo.keyPair, parsedParams, opLatency)
+        val maxOps = if (securityLevel == SecurityLevel.STRONGBOX) STRONGBOX_MAX_CONCURRENT_OPS else MAX_CONCURRENT_OPS_PER_UID
+        pruneOpsForUid(callingUid, softwareOperation, maxOps)
         val operationBinder = SoftwareOperationBinder(softwareOperation)
 
         val response =
@@ -292,6 +346,11 @@ class KeyMintSecurityLevelInterceptor(
 
                 if (isSymmetric) {
                     SystemLogger.debug("[TX_ID: $txId] Symmetric algorithm ${parsedParams.algorithm} → forwarding to HAL")
+                    return TransactionResult.ContinueAndSkipPost
+                }
+
+                if (securityLevel == SecurityLevel.STRONGBOX && !isStrongBoxCapable(parsedParams)) {
+                    SystemLogger.info("[TX_ID: $txId] StrongBox-unsupported params (algo=${parsedParams.algorithm} size=${parsedParams.keySize}) → forwarding to HAL for rejection")
                     return TransactionResult.ContinueAndSkipPost
                 }
 
@@ -380,7 +439,8 @@ class KeyMintSecurityLevelInterceptor(
         )
 
         val elapsedMs = (System.nanoTime() - startNs) / 1_000_000
-        val delayMs = TEE_LATENCY_FLOOR_MS - elapsedMs
+        val floor = if (securityLevel == SecurityLevel.STRONGBOX) STRONGBOX_KEYGEN_LATENCY_FLOOR_MS else TEE_LATENCY_FLOOR_MS
+        val delayMs = floor - elapsedMs
         if (delayMs > 0) Thread.sleep(delayMs)
 
         return InterceptorUtils.createTypedObjectReply(response.metadata)
@@ -572,7 +632,13 @@ class KeyMintSecurityLevelInterceptor(
         private const val KEYMINT_INVALID_INPUT_LENGTH = -21
         private const val RESPONSE_INVALID_ARGUMENT = 20
         private const val TEE_LATENCY_FLOOR_MS = 15L
+        private const val STRONGBOX_KEYGEN_LATENCY_FLOOR_MS = 250L
+        private const val STRONGBOX_OP_LATENCY_FLOOR_MS = 80L
+        private const val KEYMINT_TOO_MANY_OPERATIONS = -29
         private const val KEYMINT_CANNOT_ATTEST_IDS = -66
+        private const val MAX_CONCURRENT_OPS_PER_UID = 15
+        private const val STRONGBOX_MAX_CONCURRENT_OPS = 4
+        private const val STRONGBOX_OP_WINDOW_NS = 10_000_000_000L // 10s
         private const val MAX_CONCURRENT_HW_KEYGEN_PER_UID = 2
         // Sliding window: max hardware keygen permits per UID within the burst window
         private const val MAX_HW_KEYGEN_PER_WINDOW = 2
@@ -580,6 +646,12 @@ class KeyMintSecurityLevelInterceptor(
         private val uidHardwareKeygenCount = ConcurrentHashMap<Int, AtomicInteger>()
         private val hardwareKeygenTxIds = ConcurrentHashMap.newKeySet<Long>()
         private val uidKeygenTimestamps = ConcurrentHashMap<Int, MutableList<Long>>()
+
+        private fun isStrongBoxCapable(params: KeyMintAttestation): Boolean = when (params.algorithm) {
+            Algorithm.RSA -> params.keySize <= 2048
+            Algorithm.EC -> params.ecCurve == null || params.ecCurve == EcCurve.P_256
+            else -> true
+        }
 
         private fun hardwareKeygenCount(uid: Int): AtomicInteger =
             uidHardwareKeygenCount.computeIfAbsent(uid) { AtomicInteger(0) }
