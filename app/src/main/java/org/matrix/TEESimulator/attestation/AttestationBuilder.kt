@@ -194,9 +194,13 @@ object AttestationBuilder {
             )
         }
 
-        params.padding.forEach {
+        if (params.padding.isNotEmpty()) {
             list.add(
-                DERTaggedObject(true, AttestationConstants.TAG_PADDING, ASN1Integer(it.toLong()))
+                DERTaggedObject(
+                    true,
+                    AttestationConstants.TAG_PADDING,
+                    DERSet(params.padding.map { ASN1Integer(it.toLong()) }.toTypedArray()),
+                )
             )
         }
 
